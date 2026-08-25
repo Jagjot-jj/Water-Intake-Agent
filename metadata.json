@@ -1,0 +1,6 @@
+{
+  "name": "Water Intake Coach",
+  "description": "An agentic AI hydration assistant with a multi-step plan-act loop, real tool calling, and persistent conversation memory.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

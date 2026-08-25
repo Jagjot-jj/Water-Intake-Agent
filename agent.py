@@ -1,0 +1,421 @@
+"""AI Agent implementation for the Water Intake Coach.
+
+Architecture:
+  Plan-Act-Observe-Decide Loop
+  1. Analyze user request and formulate plan.
+  2. Select and execute tool(s) (e.g. log_water, get_progress).
+  3. Observe structured tool outputs.
+  4. Evaluate progress and decide if further actions are required.
+  5. Formulate grounded, gentle, non-medical final response with health disclaimer.
+  6. Record complete trace and persist in conversation memory.
+"""
+import json
+import os
+import re
+from typing import Any, Dict, List, Optional
+from config import GEMINI_MODEL, HEALTH_DISCLAIMER, MAX_AGENT_STEPS
+from memory import ConversationMemory
+from tools import get_progress, log_water, set_daily_goal
+
+try:
+    from google import genai
+    from google.genai import types
+    GENAI_AVAILABLE = True
+except ImportError:
+    GENAI_AVAILABLE = False
+
+
+class WaterIntakeAgent:
+    """Agent that coaches users to reach their daily water intake goal through a plan-act loop."""
+
+    def __init__(self, memory: Optional[ConversationMemory] = None, api_key: Optional[str] = None):
+        self.memory = memory if memory is not None else ConversationMemory()
+        self.api_key = api_key or os.getenv("GEMINI_API_KEY", "")
+        self.client = None
+
+        if self.api_key and GENAI_AVAILABLE:
+            try:
+                self.client = genai.Client(api_key=self.api_key)
+            except Exception as e:
+                print(f"[Agent Init Warning] Could not initialize Gemini client: {e}")
+
+    def execute_tool(self, tool_name: str, tool_args: Dict[str, Any]) -> Dict[str, Any]:
+        """Execute Python tool and return structured dictionary result."""
+        if tool_name == "log_water":
+            ml = tool_args.get("ml", 0)
+            return log_water(ml, self.memory)
+        elif tool_name == "get_progress":
+            return get_progress(self.memory)
+        elif tool_name == "set_daily_goal":
+            ml = tool_args.get("ml", 2500)
+            return set_daily_goal(ml, self.memory)
+        else:
+            return {
+                "status": "error",
+                "message": f"Unknown tool '{tool_name}'"
+            }
+
+    def _rule_based_agent_loop(self, user_input: str) -> Dict[str, Any]:
+        """Deterministic Plan-Act-Observe-Decide loop for offline testing or fallback."""
+        trace: List[Dict[str, Any]] = []
+        user_lower = user_input.lower().strip()
+
+        # Step 1: Plan
+        step_1 = {
+            "step_number": 1,
+            "type": "plan",
+            "description": "Analyzed user message to identify hydration intent, quantities, and necessary tool steps."
+        }
+        trace.append(step_1)
+
+        # Check for goal update intent
+        goal_match = re.search(r"(?:goal|target)\s*(?:is|to|=|set to)?\s*(\d+)\s*(?:ml)?", user_lower)
+        if "goal" in user_lower and goal_match and not ("drank" in user_lower or "logged" in user_lower):
+            target_ml = int(goal_match.group(1))
+            trace.append({
+                "step_number": 2,
+                "type": "tool_call",
+                "tool": "set_daily_goal",
+                "arguments": {"ml": target_ml}
+            })
+            result = self.execute_tool("set_daily_goal", {"ml": target_ml})
+            trace.append({
+                "step_number": 3,
+                "type": "tool_result",
+                "tool": "set_daily_goal",
+                "result": result
+            })
+            trace.append({
+                "step_number": 4,
+                "type": "observation",
+                "description": f"Daily target updated to {target_ml} ml."
+            })
+            response = (
+                f"I have updated your daily water intake goal to {target_ml} ml. "
+                f"You currently have {result['today_intake_ml']} ml recorded today with "
+                f"{result['remaining_ml']} ml remaining ({result['progress_percent']}%)."
+            )
+            return {"final_response": response, "trace": trace, "plan": step_1["description"]}
+
+        # Check for water logging intent
+        # Match patterns like: "500 ml", "drank 300", "500ml", "had 250 ml", "another 300 ml"
+        log_match = re.search(r"(?:drank|had|logged|add|plus|another)?\s*(\d+)\s*(?:ml|milliliters)?", user_lower)
+        explicit_log_keywords = ["drank", "had", "logged", "drinking", "consumed", "another", "ml", "milliliter", "glass", "cup", "bottle"]
+        has_log_intent = any(kw in user_lower for kw in explicit_log_keywords) or re.search(r"\b\d+\s*ml\b", user_lower)
+
+        amount_to_log = None
+        if has_log_intent:
+            amounts = re.findall(r"\b(\d+)\s*(?:ml)?\b", user_lower)
+            if amounts:
+                # Pick the most relevant integer (e.g. 500, 300)
+                for a in amounts:
+                    val = int(a)
+                    if 10 <= val <= 5000:
+                        amount_to_log = val
+                        break
+
+        if amount_to_log is not None:
+            # Step 2: Act (Tool Call: log_water)
+            trace.append({
+                "step_number": len(trace) + 1,
+                "type": "tool_call",
+                "tool": "log_water",
+                "arguments": {"ml": amount_to_log}
+            })
+            log_res = self.execute_tool("log_water", {"ml": amount_to_log})
+            trace.append({
+                "step_number": len(trace) + 1,
+                "type": "tool_result",
+                "tool": "log_water",
+                "result": log_res
+            })
+
+            # Step 3: Act (Tool Call: get_progress for comprehensive evaluation)
+            trace.append({
+                "step_number": len(trace) + 1,
+                "type": "tool_call",
+                "tool": "get_progress",
+                "arguments": {}
+            })
+            progress_res = self.execute_tool("get_progress", {})
+            trace.append({
+                "step_number": len(trace) + 1,
+                "type": "tool_result",
+                "tool": "get_progress",
+                "result": progress_res
+            })
+
+            # Step 4: Observation & Decision
+            total = progress_res["today_intake_ml"]
+            goal = progress_res["daily_goal_ml"]
+            remaining = progress_res["remaining_ml"]
+            percent = progress_res["progress_percent"]
+
+            decision_notes = ""
+            if progress_res["goal_exceeded"]:
+                decision_notes = f"Daily goal exceeded ({total}/{goal} ml). Acknowledge achievement and advise not to over-hydrate."
+                advice = (
+                    f"Great job! You have exceeded your daily goal with {total} ml recorded "
+                    f"({percent}% of your {goal} ml target). Remember that hydration needs vary and "
+                    "there is no need to drink excessively."
+                )
+            elif progress_res["goal_met"]:
+                decision_notes = f"Daily goal reached ({total}/{goal} ml). Celebrate completion."
+                advice = (
+                    f"Congratulations! You reached your daily goal of {goal} ml! "
+                    f"You have logged {total} ml ({percent}%) so far today."
+                )
+            elif remaining <= 400:
+                decision_notes = f"Very close to goal ({remaining} ml left). Provide gentle small nudge."
+                advice = (
+                    f"Logged {amount_to_log} ml! You're almost there: you have had {total} ml "
+                    f"and only {remaining} ml left to reach your {goal} ml goal ({percent}% completed)."
+                )
+            else:
+                decision_notes = f"Goal in progress ({remaining} ml remaining). Provide status update."
+                advice = (
+                    f"Logged {amount_to_log} ml. You've had {total} ml so far today, "
+                    f"with {remaining} ml remaining to hit your {goal} ml goal ({percent}% completed)."
+                )
+
+            trace.append({
+                "step_number": len(trace) + 1,
+                "type": "decision",
+                "description": decision_notes
+            })
+
+            return {"final_response": advice, "trace": trace, "plan": step_1["description"]}
+
+        # Check for inquiry / progress check
+        # e.g., "How much more do I need?", "How much have I had today?", "What is my progress?"
+        trace.append({
+            "step_number": len(trace) + 1,
+            "type": "tool_call",
+            "tool": "get_progress",
+            "arguments": {}
+        })
+        progress_res = self.execute_tool("get_progress", {})
+        trace.append({
+            "step_number": len(trace) + 1,
+            "type": "tool_result",
+            "tool": "get_progress",
+            "result": progress_res
+        })
+
+        total = progress_res["today_intake_ml"]
+        goal = progress_res["daily_goal_ml"]
+        remaining = progress_res["remaining_ml"]
+        percent = progress_res["progress_percent"]
+
+        trace.append({
+            "step_number": len(trace) + 1,
+            "type": "decision",
+            "description": f"Retrieved status: {total}/{goal} ml ({percent}%). Formulating clear response."
+        })
+
+        if "how much more" in user_lower or "remaining" in user_lower or "need" in user_lower:
+            if progress_res["goal_met"]:
+                response = f"You have already met your daily goal! You've logged {total} ml today (target was {goal} ml)."
+            else:
+                response = f"You need {remaining} ml more to reach your {goal} ml goal today. You have had {total} ml so far ({percent}%)."
+        else:
+            response = (
+                f"You have had {total} ml of water today. "
+                f"Your daily goal is {goal} ml, leaving {remaining} ml remaining ({percent}% completed)."
+            )
+
+        return {"final_response": response, "trace": trace, "plan": step_1["description"]}
+
+    def run(self, user_input: str) -> Dict[str, Any]:
+        """Execute the agent for a user message, maintaining state across turns."""
+        if not user_input or not user_input.strip():
+            return {
+                "response": "Please enter a message or specify the amount of water you drank.",
+                "trace": [],
+                "memory_state": self.memory.get_state(),
+                "disclaimer": HEALTH_DISCLAIMER
+            }
+
+        # Check if Gemini API is configured for full LLM-driven tool calling
+        if self.client and self.api_key:
+            try:
+                result = self._gemini_agent_loop(user_input)
+            except Exception as e:
+                print(f"[Agent Warning] Gemini API execution failed: {e}. Using deterministic plan-act engine.")
+                result = self._rule_based_agent_loop(user_input)
+        else:
+            result = self._rule_based_agent_loop(user_input)
+
+        final_response = result["final_response"]
+        trace = result["trace"]
+        plan = result.get("plan", "Analyzed user hydration request and formulated step sequence.")
+
+        # Persist this complete interaction turn in ConversationMemory
+        self.memory.add_turn(
+            user_message=user_input,
+            plan=plan,
+            steps=trace,
+            final_response=final_response
+        )
+
+        return {
+            "response": final_response,
+            "trace": trace,
+            "memory_state": self.memory.get_state(),
+            "disclaimer": HEALTH_DISCLAIMER
+        }
+
+    def _gemini_agent_loop(self, user_input: str) -> Dict[str, Any]:
+        """Multi-step agent loop using Gemini Function Calling."""
+        trace: List[Dict[str, Any]] = []
+
+        system_instruction = (
+            "You are the Water Intake Coach AI Agent. Your role is to help users reach their daily "
+            "water intake target. You have access to real tools: `log_water(ml)` and `get_progress()`. "
+            "When a user mentions drinking water, you MUST call `log_water` with the amount. "
+            "After logging, check progress if needed to evaluate remaining water and goal completion. "
+            "Be encouraging, gentle, and strictly avoid giving medical advice or urging dangerous over-hydration. "
+            f"Current conversation context: Goal={self.memory.daily_goal_ml}ml, Today's Intake={self.memory.today_intake_ml}ml."
+        )
+
+        # Record initial planning step
+        trace.append({
+            "step_number": 1,
+            "type": "plan",
+            "description": f"Analyzed user prompt: '{user_input}'. Formulating tool selection strategy."
+        })
+
+        # Define tool functions for Gemini SDK
+        tools_config = [
+            types.Tool(
+                function_declarations=[
+                    types.FunctionDeclaration(
+                        name="log_water",
+                        description="Records water intake in milliliters (ml) and computes progress metrics.",
+                        parameters=types.Schema(
+                            type=types.Type.OBJECT,
+                            properties={
+                                "ml": types.Schema(
+                                    type=types.Type.INTEGER,
+                                    description="Amount of water in milliliters, e.g., 250, 500."
+                                )
+                            },
+                            required=["ml"]
+                        )
+                    ),
+                    types.FunctionDeclaration(
+                        name="get_progress",
+                        description="Retrieves current water consumption progress, remaining ml, and target status.",
+                        parameters=types.Schema(
+                            type=types.Type.OBJECT,
+                            properties={}
+                        )
+                    ),
+                    types.FunctionDeclaration(
+                        name="set_daily_goal",
+                        description="Updates the user daily water goal in milliliters (default 2500 ml).",
+                        parameters=types.Schema(
+                            type=types.Type.OBJECT,
+                            properties={
+                                "ml": types.Schema(
+                                    type=types.Type.INTEGER,
+                                    description="New target in ml."
+                                )
+                            },
+                            required=["ml"]
+                        )
+                    )
+                ]
+            )
+        ]
+
+        messages = [
+            types.Content(
+                role="user",
+                parts=[types.Part.from_text(text=user_input)]
+            )
+        ]
+
+        step_count = 1
+        final_response_text = ""
+
+        # Plan-Act Loop (with max step protection)
+        while step_count < MAX_AGENT_STEPS:
+            step_count += 1
+
+            response = self.client.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=messages,
+                config=types.GenerateContentConfig(
+                    system_instruction=system_instruction,
+                    tools=tools_config,
+                    temperature=0.2
+                )
+            )
+
+            # Check if model requested tool call(s)
+            function_calls = response.function_calls
+            if function_calls:
+                for fc in function_calls:
+                    tool_name = fc.name
+                    tool_args = fc.args or {}
+
+                    trace.append({
+                        "step_number": len(trace) + 1,
+                        "type": "tool_call",
+                        "tool": tool_name,
+                        "arguments": tool_args
+                    })
+
+                    # Act: execute tool in Python
+                    tool_result = self.execute_tool(tool_name, tool_args)
+
+                    trace.append({
+                        "step_number": len(trace) + 1,
+                        "type": "tool_result",
+                        "tool": tool_name,
+                        "result": tool_result
+                    })
+
+                    trace.append({
+                        "step_number": len(trace) + 1,
+                        "type": "observation",
+                        "description": f"Tool '{tool_name}' output: {json.dumps(tool_result)}"
+                    })
+
+                    # Append model turn and tool response turn to context
+                    messages.append(response.candidates[0].content)
+                    messages.append(
+                        types.Content(
+                            role="tool",
+                            parts=[
+                                types.Part.from_function_response(
+                                    name=tool_name,
+                                    response={"result": tool_result}
+                                )
+                            ]
+                        )
+                    )
+            else:
+                # No more tools requested; final response generated
+                final_response_text = response.text or ""
+                trace.append({
+                    "step_number": len(trace) + 1,
+                    "type": "decision",
+                    "description": "All necessary tool actions completed. Formulated final response."
+                })
+                break
+
+        if not final_response_text:
+            # Fallback if loop ended via max steps
+            state = self.memory.get_state()
+            final_response_text = (
+                f"You have had {state['today_intake_ml']} ml today out of your {state['daily_goal_ml']} ml target "
+                f"({state['remaining_ml']} ml remaining, {state['progress_percent']}%)."
+            )
+
+        return {
+            "final_response": final_response_text,
+            "trace": trace,
+            "plan": trace[0]["description"] if trace else "Plan formulated"
+        }
