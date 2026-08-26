@@ -49,6 +49,32 @@ interface MemoryState {
   history: TurnRecord[];
 }
 
+function resolveIntakeDate(text: string) {
+  const today = new Date();
+  const todayIso = today.toISOString().split('T')[0];
+  const match = text.match(/\b(day\s+before\s+yesterday|ereyesterday|day\s+after\s+tomorrow|overmorrow|yesterday|last\s+day|today|tomorrow|tommorrow)\b/);
+  if (match) {
+    const label = match[1];
+    const offset = /day before|ereyesterday/.test(label) ? -2 : /yesterday|last day/.test(label) ? -1 : /day after|overmorrow/.test(label) ? 2 : /tomorrow/.test(label) ? 1 : 0;
+    return { date: new Date(today.getTime() + offset * 86400000).toISOString().split('T')[0], hasTimeline: true, label };
+  }
+
+  const isoMatch = text.match(/\b(?:on|for)?\s*(\d{4}-\d{2}-\d{2})\b/);
+  if (isoMatch) return { date: isoMatch[1], hasTimeline: true, label: isoMatch[1] };
+  const offsetMatch = text.match(/\bin\s+(\d+)\s+(day|days|week|weeks)\b/);
+  if (offsetMatch) {
+    const offset = Number(offsetMatch[1]) * (offsetMatch[2].startsWith('week') ? 7 : 1);
+    return { date: new Date(today.getTime() + offset * 86400000).toISOString().split('T')[0], hasTimeline: true, label: `in ${offsetMatch[1]} ${offsetMatch[2]}` };
+  }
+  if (/\bnext week\b/.test(text)) return { date: new Date(today.getTime() + 7 * 86400000).toISOString().split('T')[0], hasTimeline: true, label: 'next week' };
+  if (/\bnext month\b/.test(text)) {
+    const nextMonth = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth() + 1, today.getUTCDate()));
+    return { date: nextMonth.toISOString().split('T')[0], hasTimeline: true, label: 'next month' };
+  }
+  const hasUnsupportedTimeline = /\b(last|this)\s+(week|month)\b/.test(text);
+  return { date: null, hasTimeline: hasUnsupportedTimeline, label: '' };
+}
+
 export default function App() {
   // Conversation Memory State (Identical to Python ConversationMemory class)
   const [memory, setMemory] = useState<MemoryState>({
@@ -142,6 +168,9 @@ export default function App() {
       let currentMem = { ...memory };
       const trace: TraceStep[] = [];
       const userLower = userText.toLowerCase().trim();
+      const todayIso = new Date().toISOString().split('T')[0];
+      const resolvedDate = resolveIntakeDate(userLower);
+      const hasTimeline = resolvedDate.hasTimeline;
 
       // Step 1: PLAN
       const planDesc = `Analyzed user input: "${userText}". Formulating tool calling sequence.`;
@@ -193,14 +222,12 @@ export default function App() {
           }
         }
 
-        if (amountToLog !== null) {
-          const isHistorical = /\b(yesterday|last\s+day)\b/.test(userLower);
-          const isFuture = /\b(tomorrow|tommorrow)\b/.test(userLower);
-          const intakeDate = isHistorical
-            ? new Date(Date.now() - 86400000).toISOString().split('T')[0]
-            : isFuture
-              ? new Date(Date.now() + 86400000).toISOString().split('T')[0]
-            : new Date().toISOString().split('T')[0];
+        const unsupportedTimeline = hasTimeline && !resolvedDate.date;
+        if (amountToLog !== null && !unsupportedTimeline) {
+          const timelineLabel = resolvedDate.label;
+          const intakeDate = resolvedDate.date || new Date().toISOString().split('T')[0];
+          const isHistorical = new Date(`${intakeDate}T00:00:00Z`) < new Date(`${todayIso}T00:00:00Z`);
+          const isFuture = new Date(`${intakeDate}T00:00:00Z`) > new Date(`${todayIso}T00:00:00Z`);
           // Act: Step 2 -> Tool Call log_water
           trace.push({
             step_number: 2,
@@ -277,6 +304,9 @@ export default function App() {
             type: 'decision',
             description: decisionDesc
           });
+        } else if (unsupportedTimeline) {
+          finalResponse = "I can log water for a specific date, but I don't recognize that timeline. Please say today, yesterday, tomorrow, or provide an ISO date like 2026-08-28.";
+          trace.push({ step_number: 2, type: 'decision', description: 'Requested clarification because the timeline was not supported.' });
         } else {
           // Progress inquiry only
           trace.push({
@@ -313,7 +343,7 @@ export default function App() {
       }
 
       // Ask Gemini to refine the grounded response through the server-side API.
-      try {
+      if (!hasTimeline) try {
         const geminiResponse = await fetch('/api/chat', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },

@@ -58,6 +58,44 @@ class WaterIntakeAgent:
                 "message": f"Unknown tool '{tool_name}'"
             }
 
+    @staticmethod
+    def _intake_date_from_text(user_lower: str) -> tuple[Optional[date], bool, str]:
+        """Resolve supported relative or ISO dates without inferring an unspecified date."""
+        supported_dates = [
+            (r"\b(day\s+before\s+yesterday|ereyesterday)\b", -2, "the day before yesterday"),
+            (r"\b(day\s+after\s+tomorrow|overmorrow)\b", 2, "the day after tomorrow"),
+            (r"\b(yesterday|last\s+day)\b", -1, "yesterday"),
+            (r"\b(today)\b", 0, "today"),
+            (r"\b(tomorrow|tommorrow)\b", 1, "tomorrow"),
+        ]
+        for pattern, offset, label in supported_dates:
+            if re.search(pattern, user_lower):
+                return date.today() + timedelta(days=offset), True, label
+
+        iso_match = re.search(r"\b(?:on|for)?\s*(\d{4}-\d{2}-\d{2})\b", user_lower)
+        if iso_match:
+            try:
+                return date.fromisoformat(iso_match.group(1)), True, iso_match.group(1)
+            except ValueError:
+                return None, True, ""
+
+        offset_match = re.search(r"\bin\s+(\d+)\s+(day|days|week|weeks)\b", user_lower)
+        if offset_match:
+            count = int(offset_match.group(1))
+            multiplier = 7 if offset_match.group(2).startswith("week") else 1
+            return date.today() + timedelta(days=count * multiplier), True, f"in {count} {offset_match.group(2)}"
+
+        if re.search(r"\bnext\s+week\b", user_lower):
+            return date.today() + timedelta(days=7), True, "next week"
+        if re.search(r"\bnext\s+month\b", user_lower):
+            month = date.today().month % 12 + 1
+            year = date.today().year + (date.today().month == 12)
+            day = min(date.today().day, [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month - 1])
+            return date(year, month, day), True, "next month"
+
+        timeline_pattern = r"\b(last|this)\s+(week|month)\b"
+        return None, bool(re.search(timeline_pattern, user_lower)), ""
+
     def _rule_based_agent_loop(self, user_input: str) -> Dict[str, Any]:
         """Deterministic Plan-Act-Observe-Decide loop for offline testing or fallback."""
         trace: List[Dict[str, Any]] = []
@@ -118,14 +156,13 @@ class WaterIntakeAgent:
                         break
 
         if amount_to_log is not None:
-            date_match = re.search(r"\b(yesterday|last\s+day|tomorrow|tommorrow)\b", user_lower)
-            is_historical = bool(date_match and date_match.group(1) in {"yesterday", "last day"})
-            is_future = bool(date_match and date_match.group(1) in {"tomorrow", "tommorrow"})
-            intake_date = (
-                date.today() - timedelta(days=1) if is_historical
-                else date.today() + timedelta(days=1) if is_future
-                else None
-            )
+            intake_date, has_timeline, timeline_label = self._intake_date_from_text(user_lower)
+            if has_timeline and intake_date is None:
+                clarification = "I can log water for a specific date, but I don't recognize that timeline. Please say today, yesterday, tomorrow, or provide an ISO date like 2026-08-28."
+                trace.append({"step_number": len(trace) + 1, "type": "decision", "description": "Requested clarification because the timeline was not supported."})
+                return {"final_response": clarification, "trace": trace, "plan": step_1["description"]}
+            is_historical = intake_date is not None and intake_date < date.today()
+            is_future = intake_date is not None and intake_date > date.today()
             # Step 2: Act (Tool Call: log_water)
             trace.append({
                 "step_number": len(trace) + 1,
@@ -199,9 +236,9 @@ class WaterIntakeAgent:
             })
 
             if is_historical:
-                advice = f"Logged {amount_to_log} ml for yesterday. Today's total remains {total} ml ({percent}% of your {goal} ml goal)."
+                advice = f"Logged {amount_to_log} ml for {timeline_label}. Today's total remains {total} ml ({percent}% of your {goal} ml goal)."
             elif is_future:
-                advice = f"Scheduled {amount_to_log} ml for tomorrow. Today's total remains {total} ml ({percent}% of your {goal} ml goal)."
+                advice = f"Scheduled {amount_to_log} ml for {timeline_label}. Today's total remains {total} ml ({percent}% of your {goal} ml goal)."
             return {"final_response": advice, "trace": trace, "plan": step_1["description"]}
 
         # Check for inquiry / progress check
@@ -255,7 +292,8 @@ class WaterIntakeAgent:
             }
 
         # Check if Gemini API is configured for full LLM-driven tool calling
-        if self.client and self.api_key:
+        has_timeline = bool(re.search(r"\b(yesterday|ereyesterday|tomorrow|tommorrow|overmorrow|today|last\s+day|day\s+before|day\s+after|next\s+week|next\s+month)\b|\bin\s+\d+\s+(day|days|week|weeks)\b|\b(?:on|for)?\s*\d{4}-\d{2}-\d{2}\b", user_input.lower()))
+        if self.client and self.api_key and not has_timeline:
             memory_snapshot = copy.deepcopy(self.memory.__dict__)
             try:
                 result = self._gemini_agent_loop(user_input)

@@ -129,6 +129,32 @@ class TestWaterCoachTools:
         assert agent.memory.today_intake_ml == 100
         assert "tomorrow" in result["response"].lower()
 
+    def test_agent_supports_extended_relative_dates(self):
+        """Extended relative dates are resolved without changing today's total."""
+        agent = WaterIntakeAgent()
+        result = agent.run("I had 250 ml ereyesterday")
+
+        assert agent.memory.today_intake_ml == 0
+        assert "day before yesterday" in result["response"].lower()
+
+    def test_agent_supports_next_week_timeline(self):
+        """Next week is scheduled seven days ahead instead of counted today."""
+        agent = WaterIntakeAgent()
+        result = agent.run("I will drink 250 ml next week")
+
+        assert agent.memory.today_intake_ml == 0
+        assert agent.memory.logs[-1]["date"] == (date.today() + timedelta(days=7)).isoformat()
+        assert "next week" in result["response"].lower()
+
+    def test_agent_supports_relative_and_explicit_dates(self):
+        """Supported week, month, and ISO date methods are logged for their dates."""
+        agent = WaterIntakeAgent()
+        result = agent.run("I had 250 ml on 2026-09-15")
+
+        assert agent.memory.today_intake_ml == 0
+        assert agent.memory.logs[-1]["date"] == "2026-09-15"
+        assert "2026-09-15" in result["response"]
+
     def test_multiple_tool_calls_in_agent_loop(self):
         """Verify the agent executes multiple tools (e.g. log_water + get_progress) in a single turn."""
         agent = WaterIntakeAgent()
