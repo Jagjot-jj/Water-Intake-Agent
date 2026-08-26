@@ -135,7 +135,7 @@ export default function App() {
     setMessages(prev => [...prev, { role: 'user', content: userText, time: timeStr }]);
     setInputMessage('');
 
-    setTimeout(() => {
+    setTimeout(async () => {
       let currentMem = { ...memory };
       const trace: TraceStep[] = [];
       const userLower = userText.toLowerCase().trim();
@@ -295,6 +295,33 @@ export default function App() {
         }
       }
 
+      // Ask Gemini to refine the grounded response through the server-side API.
+      try {
+        const geminiResponse = await fetch('/api/chat', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            message: userText,
+            state: executeGetProgress(currentMem),
+            local_response: finalResponse
+          })
+        });
+
+        if (geminiResponse.ok) {
+          const data = await geminiResponse.json();
+          if (typeof data.response === 'string' && data.response.trim()) {
+            finalResponse = data.response;
+            trace.push({
+              step_number: trace.length + 1,
+              type: 'observation',
+              description: 'Gemini refined the verified hydration response through the secure server API.'
+            });
+          }
+        }
+      } catch {
+        // The deterministic response remains available when Gemini is unavailable.
+      }
+
       // Record Turn in ConversationMemory
       const turnRecord: TurnRecord = {
         turn_index: currentMem.history.length + 1,
@@ -344,21 +371,22 @@ export default function App() {
   const strokeDashoffset = circumference - (Math.min(100, progress_percent) / 100) * circumference;
 
   return (
-    <div className="flex flex-col h-screen w-full bg-slate-50 text-slate-900 font-sans p-6 overflow-hidden">
+    <div className="flex flex-col min-h-screen w-full text-slate-900 p-4 md:p-6 overflow-hidden">
       {/* Header */}
-      <header className="flex justify-between items-center mb-6 bg-white p-4 rounded-xl shadow-sm border border-slate-200">
+      <header className="flex flex-col gap-4 md:flex-row md:justify-between md:items-center mb-5 bg-white/90 p-4 md:p-5 rounded-2xl shadow-sm border border-slate-200/80 backdrop-blur-sm">
         <div>
-          <h1 className="text-2xl font-bold text-blue-600 flex items-center gap-2">
-            <span>💧</span> Water Intake Coach
+          <h1 className="text-2xl font-bold text-cyan-800 flex items-center gap-2 tracking-tight">
+            <span className="flex h-9 w-9 items-center justify-center rounded-xl bg-cyan-50 text-lg">💧</span>
+            Water Intake Coach
           </h1>
-          <p className="text-xs text-slate-500 uppercase tracking-wider font-semibold">
+          <p className="mt-1 text-[11px] text-slate-500 uppercase tracking-wider font-semibold">
             University Agentic AI Project • T16 Health (Plan-Act Agent • Real Tools • Memory)
           </p>
         </div>
-        <div className="flex items-center gap-4">
+        <div className="flex flex-col-reverse items-start gap-3 sm:flex-row sm:items-center md:justify-end">
           <button
             onClick={handleResetMemory}
-            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold text-slate-600 bg-slate-100 hover:bg-slate-200 transition-colors"
+            className="flex items-center gap-1.5 px-3 py-2 rounded-lg text-xs font-semibold text-slate-600 bg-slate-100 hover:bg-slate-200 transition-colors"
             title="Reset conversation memory"
           >
             <RotateCcw className="w-3.5 h-3.5" />
@@ -373,9 +401,9 @@ export default function App() {
       </header>
 
       {/* Main 3-Column Agentic Layout matching Clean Minimalism */}
-      <main className="flex gap-6 flex-1 min-h-0">
+      <main className="flex flex-col lg:flex-row gap-5 flex-1 min-h-0">
         {/* Left Column: Progress Gauge & Memory State */}
-        <section className="w-1/4 flex flex-col gap-4 overflow-y-auto">
+        <section className="w-full lg:w-1/4 flex flex-col gap-4 overflow-y-auto">
           {/* Daily Progress Card */}
           <div className="bg-white p-5 rounded-2xl border border-slate-200 shadow-sm flex flex-col">
             <div className="flex justify-between items-center mb-3">
@@ -509,7 +537,7 @@ export default function App() {
         </section>
 
         {/* Center Column: Conversation & Quick Evaluation Scenarios */}
-        <section className="flex-1 flex flex-col bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
+        <section className="flex-1 min-h-[30rem] flex flex-col bg-white rounded-2xl border border-slate-200/80 shadow-sm overflow-hidden">
           {/* Quick Scenario Buttons for Teacher / Evaluator */}
           <div className="p-3 border-b border-slate-100 bg-slate-50/80 flex flex-wrap items-center gap-2">
             <span className="text-[11px] font-bold uppercase tracking-wider text-slate-500 flex items-center gap-1 mr-1">
@@ -628,7 +656,7 @@ export default function App() {
         </section>
 
         {/* Right Column: Agentic Multi-Step Trace */}
-        <section className="w-1/3 flex flex-col bg-slate-100 rounded-2xl border border-slate-200 overflow-hidden shadow-sm">
+        <section className="w-full lg:w-1/3 min-h-[20rem] flex flex-col bg-slate-100/90 rounded-2xl border border-slate-200 overflow-hidden shadow-sm">
           <div className="p-4 border-b border-slate-200 bg-slate-200/80 flex justify-between items-center">
             <h2 className="text-xs font-bold uppercase tracking-widest text-slate-700 flex items-center gap-1.5">
               <Cpu className="w-4 h-4 text-blue-600" />
