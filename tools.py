@@ -10,7 +10,7 @@ from typing import Any, Dict, Optional
 from memory import ConversationMemory
 
 
-def log_water(ml: int, memory: ConversationMemory) -> Dict[str, Any]:
+def log_water(ml: int, memory: ConversationMemory, intake_date: Optional[date] = None) -> Dict[str, Any]:
     """Record water consumption in milliliters and update memory state.
 
     Args:
@@ -49,7 +49,8 @@ def log_water(ml: int, memory: ConversationMemory) -> Dict[str, Any]:
         }
 
     # Record intake in conversation memory
-    memory.record_intake(amount)
+    logged_date = intake_date or date.today()
+    memory.record_intake(amount, logged_date)
     total = memory.today_intake_ml
     goal = memory.daily_goal_ml
     remaining = max(0, goal - total)
@@ -66,7 +67,11 @@ def log_water(ml: int, memory: ConversationMemory) -> Dict[str, Any]:
         "progress_percent": percent,
         "goal_met": goal_met,
         "goal_exceeded": goal_exceeded,
-        "message": f"Logged {amount} ml. Total today is {total}/{goal} ml ({percent}%)."
+        "date": logged_date.isoformat(),
+        "message": (
+            f"Logged {amount} ml for {logged_date.isoformat()}. "
+            f"Total today is {total}/{goal} ml ({percent}%)."
+        )
     }
 
 

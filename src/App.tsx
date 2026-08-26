@@ -17,6 +17,7 @@ import {
 
 interface LogEntry {
   timestamp: string;
+  date: string;
   amount_ml: number;
   running_total_ml: number;
 }
@@ -79,7 +80,7 @@ export default function App() {
   const goal_exceeded = memory.today_intake_ml > memory.daily_goal_ml;
 
   // Real Tool 1: log_water(ml)
-  const executeLogWater = (ml: number, currentMem: MemoryState) => {
+  const executeLogWater = (ml: number, currentMem: MemoryState, intakeDate = new Date().toISOString().split('T')[0]) => {
     if (ml <= 0) {
       return {
         status: 'error',
@@ -87,7 +88,8 @@ export default function App() {
         message: `Cannot log ${ml} ml. Amount must be strictly greater than 0 ml.`
       };
     }
-    const newTotal = currentMem.today_intake_ml + ml;
+    const isToday = intakeDate === new Date().toISOString().split('T')[0];
+    const newTotal = isToday ? currentMem.today_intake_ml + ml : currentMem.today_intake_ml;
     const newRemaining = Math.max(0, currentMem.daily_goal_ml - newTotal);
     const newPercent = Math.round((newTotal / currentMem.daily_goal_ml) * 1000) / 10;
 
@@ -100,7 +102,8 @@ export default function App() {
       progress_percent: newPercent,
       goal_met: newTotal >= currentMem.daily_goal_ml,
       goal_exceeded: newTotal > currentMem.daily_goal_ml,
-      message: `Logged ${ml} ml. Total today is ${newTotal}/${currentMem.daily_goal_ml} ml (${newPercent}%).`
+      date: intakeDate,
+      message: `Logged ${ml} ml for ${intakeDate}. Total today is ${newTotal}/${currentMem.daily_goal_ml} ml (${newPercent}%).`
     };
   };
 
@@ -191,15 +194,22 @@ export default function App() {
         }
 
         if (amountToLog !== null) {
+          const isHistorical = /\b(yesterday|last\s+day)\b/.test(userLower);
+          const isFuture = /\b(tomorrow|tommorrow)\b/.test(userLower);
+          const intakeDate = isHistorical
+            ? new Date(Date.now() - 86400000).toISOString().split('T')[0]
+            : isFuture
+              ? new Date(Date.now() + 86400000).toISOString().split('T')[0]
+            : new Date().toISOString().split('T')[0];
           // Act: Step 2 -> Tool Call log_water
           trace.push({
             step_number: 2,
             type: 'tool_call',
             tool: 'log_water',
-            arguments: { ml: amountToLog }
+            arguments: { ml: amountToLog, ...((isHistorical || isFuture) ? { intake_date: intakeDate } : {}) }
           });
 
-          const logRes = executeLogWater(amountToLog, currentMem);
+          const logRes = executeLogWater(amountToLog, currentMem, intakeDate);
           trace.push({
             step_number: 3,
             type: 'tool_result',
@@ -213,6 +223,7 @@ export default function App() {
             ...currentMem.logs,
             {
               timestamp: new Date().toISOString(),
+              date: intakeDate,
               amount_ml: amountToLog,
               running_total_ml: logRes.total_ml
             }
@@ -241,7 +252,13 @@ export default function App() {
           const percent = progressRes.progress_percent;
 
           let decisionDesc = '';
-          if (progressRes.goal_exceeded) {
+          if (isHistorical) {
+            decisionDesc = `Historical intake recorded for ${intakeDate}; today's progress is unchanged.`;
+            finalResponse = `Logged ${amountToLog} ml for yesterday. Today's total remains ${total} ml (${percent}% of your ${goal} ml goal).`;
+          } else if (isFuture) {
+            decisionDesc = `Future intake recorded for ${intakeDate}; today's progress is unchanged.`;
+            finalResponse = `Scheduled ${amountToLog} ml for tomorrow. Today's total remains ${total} ml (${percent}% of your ${goal} ml goal).`;
+          } else if (progressRes.goal_exceeded) {
             decisionDesc = `Goal exceeded (${total}/${goal} ml). Provide positive reinforcement and remind to maintain balanced hydration.`;
             finalResponse = `Great job! You've logged ${amountToLog} ml, bringing today's total to ${total} ml (${percent}% of your ${goal} ml goal). Goal surpassed! Remember to keep hydration balanced.`;
           } else if (progressRes.goal_met) {

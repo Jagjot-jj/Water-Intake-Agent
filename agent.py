@@ -10,8 +10,10 @@ Architecture:
   6. Record complete trace and persist in conversation memory.
 """
 import json
+import copy
 import os
 import re
+from datetime import date, timedelta
 from typing import Any, Dict, List, Optional
 from config import GEMINI_MODEL, HEALTH_DISCLAIMER, MAX_AGENT_STEPS
 from memory import ConversationMemory
@@ -43,7 +45,8 @@ class WaterIntakeAgent:
         """Execute Python tool and return structured dictionary result."""
         if tool_name == "log_water":
             ml = tool_args.get("ml", 0)
-            return log_water(ml, self.memory)
+            intake_date = tool_args.get("intake_date")
+            return log_water(ml, self.memory, date.fromisoformat(intake_date) if intake_date else None)
         elif tool_name == "get_progress":
             return get_progress(self.memory)
         elif tool_name == "set_daily_goal":
@@ -115,14 +118,25 @@ class WaterIntakeAgent:
                         break
 
         if amount_to_log is not None:
+            date_match = re.search(r"\b(yesterday|last\s+day|tomorrow|tommorrow)\b", user_lower)
+            is_historical = bool(date_match and date_match.group(1) in {"yesterday", "last day"})
+            is_future = bool(date_match and date_match.group(1) in {"tomorrow", "tommorrow"})
+            intake_date = (
+                date.today() - timedelta(days=1) if is_historical
+                else date.today() + timedelta(days=1) if is_future
+                else None
+            )
             # Step 2: Act (Tool Call: log_water)
             trace.append({
                 "step_number": len(trace) + 1,
                 "type": "tool_call",
                 "tool": "log_water",
-                "arguments": {"ml": amount_to_log}
+                "arguments": {"ml": amount_to_log, **({"intake_date": intake_date.isoformat()} if intake_date else {})}
             })
-            log_res = self.execute_tool("log_water", {"ml": amount_to_log})
+            log_res = self.execute_tool(
+                "log_water",
+                {"ml": amount_to_log, **({"intake_date": intake_date.isoformat()} if intake_date else {})}
+            )
             trace.append({
                 "step_number": len(trace) + 1,
                 "type": "tool_result",
@@ -184,6 +198,10 @@ class WaterIntakeAgent:
                 "description": decision_notes
             })
 
+            if is_historical:
+                advice = f"Logged {amount_to_log} ml for yesterday. Today's total remains {total} ml ({percent}% of your {goal} ml goal)."
+            elif is_future:
+                advice = f"Scheduled {amount_to_log} ml for tomorrow. Today's total remains {total} ml ({percent}% of your {goal} ml goal)."
             return {"final_response": advice, "trace": trace, "plan": step_1["description"]}
 
         # Check for inquiry / progress check
@@ -238,9 +256,12 @@ class WaterIntakeAgent:
 
         # Check if Gemini API is configured for full LLM-driven tool calling
         if self.client and self.api_key:
+            memory_snapshot = copy.deepcopy(self.memory.__dict__)
             try:
                 result = self._gemini_agent_loop(user_input)
             except Exception as e:
+                self.memory.__dict__.clear()
+                self.memory.__dict__.update(memory_snapshot)
                 print(f"[Agent Warning] Gemini API execution failed: {e}. Using deterministic plan-act engine.")
                 result = self._rule_based_agent_loop(user_input)
         else:
@@ -273,6 +294,7 @@ class WaterIntakeAgent:
             "You are the Water Intake Coach AI Agent. Your role is to help users reach their daily "
             "water intake target. You have access to real tools: `log_water(ml)` and `get_progress()`. "
             "When a user mentions drinking water, you MUST call `log_water` with the amount. "
+            "If they say yesterday or last day, pass intake_date as yesterday's ISO date; if they say tomorrow, pass tomorrow's ISO date. Non-today intake must not count toward today's total. "
             "After logging, check progress if needed to evaluate remaining water and goal completion. "
             "Be encouraging, gentle, and strictly avoid giving medical advice or urging dangerous over-hydration. "
             f"Current conversation context: Goal={self.memory.daily_goal_ml}ml, Today's Intake={self.memory.today_intake_ml}ml."
@@ -298,6 +320,10 @@ class WaterIntakeAgent:
                                 "ml": types.Schema(
                                     type=types.Type.INTEGER,
                                     description="Amount of water in milliliters, e.g., 250, 500."
+                                ),
+                                "intake_date": types.Schema(
+                                    type=types.Type.STRING,
+                                    description="ISO date for when the water was consumed; omit for today."
                                 )
                             },
                             required=["ml"]

@@ -13,6 +13,7 @@ Tests required by assignment checklist:
 - agent maximum-step protection
 """
 import pytest
+from datetime import date, timedelta
 from config import DEFAULT_DAILY_GOAL_ML, MAX_AGENT_STEPS
 from memory import ConversationMemory
 from tools import get_progress, log_water, set_daily_goal
@@ -110,6 +111,24 @@ class TestWaterCoachTools:
         assert "800" in turn3["response"]
         assert len(agent.memory.history) == 3
 
+    def test_agent_historical_log_does_not_change_today(self):
+        """The agent should attribute yesterday's intake to yesterday."""
+        agent = WaterIntakeAgent()
+        agent.run("I drank 100 ml today")
+        result = agent.run("I had 250 ml last day")
+
+        assert agent.memory.today_intake_ml == 100
+        assert "yesterday" in result["response"].lower()
+
+    def test_agent_future_log_does_not_change_today(self):
+        """The agent should attribute planned tomorrow intake to tomorrow."""
+        agent = WaterIntakeAgent()
+        agent.run("I drank 100 ml today")
+        result = agent.run("I will drink 100 ml tommorrow")
+
+        assert agent.memory.today_intake_ml == 100
+        assert "tomorrow" in result["response"].lower()
+
     def test_multiple_tool_calls_in_agent_loop(self):
         """Verify the agent executes multiple tools (e.g. log_water + get_progress) in a single turn."""
         agent = WaterIntakeAgent()
@@ -136,3 +155,13 @@ class TestWaterCoachTools:
         assert res["status"] == "success"
         assert res["new_goal_ml"] == 3000
         assert mem.daily_goal_ml == 3000
+
+    def test_historical_log_does_not_change_today(self):
+        """Logs explicitly attributed to yesterday must not count toward today's goal."""
+        mem = ConversationMemory(daily_goal_ml=2500)
+        log_water(100, mem)
+        log_water(250, mem, date.today() - timedelta(days=1))
+
+        progress = get_progress(mem)
+        assert progress["today_intake_ml"] == 100
+        assert mem.logs[-1]["date"] == (date.today() - timedelta(days=1)).isoformat()

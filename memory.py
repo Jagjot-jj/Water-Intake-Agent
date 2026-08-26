@@ -3,7 +3,7 @@
 Maintains multi-turn state including daily goal, total intake, historical logs,
 and turn traces across the conversation session.
 """
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any, Dict, List, Optional
 from config import DEFAULT_DAILY_GOAL_ML
 
@@ -17,13 +17,19 @@ class ConversationMemory:
         self.logs: List[Dict[str, Any]] = []
         self.history: List[Dict[str, Any]] = []
 
-    def record_intake(self, amount_ml: int) -> Dict[str, Any]:
-        """Record a verified water intake amount and store the log entry."""
-        self.today_intake_ml += amount_ml
+    def record_intake(self, amount_ml: int, intake_date: Optional[date] = None) -> Dict[str, Any]:
+        """Record verified intake and update today's total only for today's date."""
+        logged_date = intake_date or date.today()
+        if logged_date == date.today():
+            self.today_intake_ml += amount_ml
+        running_total = sum(
+            log["amount_ml"] for log in self.logs if log.get("date") == logged_date.isoformat()
+        ) + amount_ml
         log_entry = {
             "timestamp": datetime.now().isoformat(),
+            "date": logged_date.isoformat(),
             "amount_ml": amount_ml,
-            "running_total_ml": self.today_intake_ml
+            "running_total_ml": running_total
         }
         self.logs.append(log_entry)
         return log_entry
