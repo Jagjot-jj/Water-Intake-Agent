@@ -170,6 +170,29 @@ class TestWaterCoachTools:
         assert agent.memory.today_intake_ml == 0
         assert "did not log" in result["response"].lower()
 
+    def test_agent_blocks_high_risk_mutations_and_claims(self):
+        """High-risk wording must not mutate state or invent a date or medical answer."""
+        agent = WaterIntakeAgent()
+        cases = [
+            ("Add -500 ml", "positive water amount"),
+            ("I drank 500 ml, but don't log it", "did not log"),
+            ("I drank 500 ml. Actually, I drank 700 ml.", "conflicting amounts"),
+            ("I drank 1 litre last night", "today or yesterday"),
+            ("Is 3 litres definitely healthy for me?", "can't provide personalized"),
+        ]
+        for message, expected in cases:
+            result = agent.run(message)
+            assert expected in result["response"].lower()
+        assert agent.memory.today_intake_ml == 0
+
+    def test_agent_converts_litre_goal(self):
+        """Goal updates accept litre units without inventing a different value."""
+        agent = WaterIntakeAgent()
+        result = agent.run("Set my goal to 2 litres")
+
+        assert agent.memory.daily_goal_ml == 2000
+        assert "2000" in result["response"]
+
     def test_multiple_tool_calls_in_agent_loop(self):
         """Verify the agent executes multiple tools (e.g. log_water + get_progress) in a single turn."""
         agent = WaterIntakeAgent()

@@ -76,9 +76,9 @@ function resolveIntakeDate(text: string) {
 }
 
 function parseAmountMl(text: string) {
-  const explicitVolume = /\d+(?:\.\d+)?\s*(?:ml|milliliters?|l|liters?)\b/.test(text);
+  const explicitVolume = /\d+(?:\.\d+)?\s*(?:ml|milliliters?|l|lit(?:er|re)s?)\b/.test(text);
   if (/\b(bottle|glass|cup|sip|sips)\b/.test(text) && !explicitVolume) return { amount: null, ambiguous: true };
-  const matches = [...text.matchAll(/(\d+(?:\.\d+)?)\s*(ml|milliliters?|l|liters?)\b/g)];
+  const matches = [...text.matchAll(/(\d+(?:\.\d+)?)\s*(ml|milliliters?|l|lit(?:er|re)s?)\b/g)];
   if (matches.length) {
     const amount = matches.reduce((total, match) => total + Number(match[1]) * (match[2].startsWith('l') ? 1000 : 1), 0);
     return { amount: Math.round(amount), ambiguous: false };
@@ -184,6 +184,7 @@ export default function App() {
       const todayIso = new Date().toISOString().split('T')[0];
       const resolvedDate = resolveIntakeDate(userLower);
       const hasTimeline = resolvedDate.hasTimeline;
+      const parsedAmount = parseAmountMl(userLower);
 
       // Step 1: PLAN
       const planDesc = `Analyzed user input: "${userText}". Formulating tool calling sequence.`;
@@ -194,6 +195,27 @@ export default function App() {
       });
 
       let finalResponse = '';
+      const doNotLog = /\b(?:don't|do not|not|without)\s+(?:log|add|record)\b/.test(userLower);
+      const negativeAmount = /(?:^|\s)-\s*\d+(?:\.\d+)?\s*(?:ml|milliliters?|l|lit(?:er|re)s?)\b/.test(userLower);
+      const contradictoryAmounts = [...userLower.matchAll(/\d+(?:\.\d+)?\s*(?:ml|milliliters?|l|lit(?:er|re)s?)\b/g)].length > 1 && /\b(?:actually|rather|but)\b/.test(userLower);
+      const ambiguousTime = /\blast\s+night\b/.test(userLower) && /\b(?:drank|had|add|log|consumed)\b/.test(userLower);
+      const medicalQuestion = /\b(?:ideal|exactly|should i drink|cure|headache|medicine|healthy for me|dehydration|weigh)\b/.test(userLower);
+      if (doNotLog) {
+        finalResponse = 'Understood. I did not log anything.';
+        trace.push({ step_number: 2, type: 'decision', description: 'Honored the request not to mutate intake state.' });
+      } else if (negativeAmount) {
+        finalResponse = 'Please provide a positive water amount; negative intake cannot be logged.';
+        trace.push({ step_number: 2, type: 'decision', description: 'Rejected a negative amount before parsing.' });
+      } else if (contradictoryAmounts) {
+        finalResponse = 'I found conflicting amounts. Which single amount should I use? I did not log anything.';
+        trace.push({ step_number: 2, type: 'decision', description: 'Requested clarification for conflicting quantities.' });
+      } else if (ambiguousTime) {
+        finalResponse = "Was that intake today or yesterday? 'Last night' can cross midnight, so I won't guess the date.";
+        trace.push({ step_number: 2, type: 'decision', description: 'Requested clarification for an ambiguous time.' });
+      } else if (medicalQuestion) {
+        finalResponse = "I only track water intake and goals. I can't provide personalized medical or guaranteed hydration advice.";
+        trace.push({ step_number: 2, type: 'decision', description: 'Declined a medical or personalized recommendation.' });
+      } else {
       const unsupportedAction = /\b(delete|remove|reset|clear|export|reminder|weekly average|monthly|database|history|last week|last month)\b/.test(userLower);
       const promptInjection = /\b(ignore|pretend|assume|fake|invent|say that)\b/.test(userLower);
       const hypothetical = /\b(if|would|could|suppose|assuming)\b|\bhow much would\b|\bwill i reach\b/.test(userLower);
@@ -227,9 +249,9 @@ export default function App() {
         const isProgressQuestion = /\b(how much|what is|what's|how many|progress|remaining|need)\b/.test(userLower);
 
       // Check if user is updating goal
-      const goalMatch = userLower.match(/(?:goal|target)\s*(?:is|to|=|set to)?\s*(\d+)\s*(?:ml)?/);
-      if (userLower.includes('goal') && goalMatch && !userLower.includes('drank') && !userLower.includes('had')) {
-        const newGoal = parseInt(goalMatch[1], 10);
+      const goalMatch = userLower.match(/(?:goal|target)\s*(?:is|to|=|set to|of)?/);
+      if (goalMatch && parsedAmount.amount !== null && !userLower.includes('drank') && !userLower.includes('had')) {
+        const newGoal = parsedAmount.amount;
         trace.push({
           step_number: 2,
           type: 'tool_call',
@@ -385,35 +407,9 @@ export default function App() {
             finalResponse = `You have had ${progressRes.today_intake_ml} ml of water today. Your daily goal is ${progressRes.daily_goal_ml} ml, leaving ${progressRes.remaining_ml} ml remaining (${progressRes.progress_percent}% completed).`;
           }
         }
-        }
       }
       }
-
-      // Ask Gemini to refine the grounded response through the server-side API.
-      if (!hasTimeline) try {
-        const geminiResponse = await fetch('/api/chat', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            message: userText,
-            state: executeGetProgress(currentMem),
-            local_response: finalResponse
-          })
-        });
-
-        if (geminiResponse.ok) {
-          const data = await geminiResponse.json();
-          if (typeof data.response === 'string' && data.response.trim()) {
-            finalResponse = data.response;
-            trace.push({
-              step_number: trace.length + 1,
-              type: 'observation',
-              description: 'Gemini refined the verified hydration response through the secure server API.'
-            });
-          }
-        }
-      } catch {
-        // The deterministic response remains available when Gemini is unavailable.
+      }
       }
 
       // Record Turn in ConversationMemory

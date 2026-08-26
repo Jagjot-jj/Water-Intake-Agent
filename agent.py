@@ -65,7 +65,7 @@ class WaterIntakeAgent:
             (r"\b(day\s+before\s+yesterday|ereyesterday)\b", -2, "the day before yesterday"),
             (r"\b(day\s+after\s+tomorrow|overmorrow)\b", 2, "the day after tomorrow"),
             (r"\b(yesterday|last\s+day)\b", -1, "yesterday"),
-            (r"\b(today)\b", 0, "today"),
+            (r"\b(today|this\s+morning|this\s+afternoon|this\s+evening)\b", 0, "today"),
             (r"\b(tomorrow|tommorrow)\b", 1, "tomorrow"),
         ]
         for pattern, offset, label in supported_dates:
@@ -93,15 +93,15 @@ class WaterIntakeAgent:
             day = min(date.today().day, [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month - 1])
             return date(year, month, day), True, "next month"
 
-        timeline_pattern = r"\b(last|this)\s+(week|month)\b"
+        timeline_pattern = r"\b(last|this)\s+(week|month|night)\b"
         return None, bool(re.search(timeline_pattern, user_lower)), ""
 
     @staticmethod
     def _parse_amount_ml(user_lower: str) -> tuple[Optional[int], bool]:
         """Parse explicit supported volumes; the second value indicates ambiguity."""
-        if re.search(r"\b(bottle|glass|cup|sip|sips)\b", user_lower) and not re.search(r"\d+(?:\.\d+)?\s*(?:ml|milliliters?|l|liters?)\b", user_lower):
+        if re.search(r"\b(bottle|glass|cup|sip|sips)\b", user_lower) and not re.search(r"\d+(?:\.\d+)?\s*(?:ml|milliliters?|l|lit(?:er|re)s?)\b", user_lower):
             return None, True
-        unit_pattern = r"(\d+(?:\.\d+)?)\s*(ml|milliliters?|l|liters?)\b"
+        unit_pattern = r"(\d+(?:\.\d+)?)\s*(ml|milliliters?|l|lit(?:er|re)s?)\b"
         matches = re.findall(unit_pattern, user_lower)
         if matches:
             total = 0.0
@@ -133,6 +133,31 @@ class WaterIntakeAgent:
             "description": "Analyzed user message to identify hydration intent, quantities, and necessary tool steps."
         }
         trace.append(step_1)
+
+        if re.search(r"\blast\s+night\b", user_lower) and re.search(r"\b(?:drank|had|add|log|consumed)\b", user_lower):
+            response = "Was that intake today or yesterday? 'Last night' can cross midnight, so I won't guess the date."
+            trace.append({"step_number": 2, "type": "decision", "description": "Requested clarification for an ambiguous time."})
+            return {"final_response": response, "trace": trace, "plan": step_1["description"]}
+
+        if re.search(r"\b(?:don't|do not|not|without)\s+(?:log|add|record)\b", user_lower):
+            response = "Understood. I did not log anything."
+            trace.append({"step_number": 2, "type": "decision", "description": "Honored the request not to mutate intake state."})
+            return {"final_response": response, "trace": trace, "plan": step_1["description"]}
+
+        if re.search(r"(?:^|\s)-\s*\d+(?:\.\d+)?\s*(?:ml|milliliters?|l|lit(?:er|re)s?)\b", user_lower):
+            response = "Please provide a positive water amount; negative intake cannot be logged."
+            trace.append({"step_number": 2, "type": "decision", "description": "Rejected a negative amount before parsing."})
+            return {"final_response": response, "trace": trace, "plan": step_1["description"]}
+
+        if len(re.findall(r"\d+(?:\.\d+)?\s*(?:ml|milliliters?|l|liters?)\b", user_lower)) > 1 and re.search(r"\b(?:actually|rather|but)\b", user_lower):
+            response = "I found conflicting amounts. Which single amount should I use? I did not log anything."
+            trace.append({"step_number": 2, "type": "decision", "description": "Requested clarification for conflicting quantities."})
+            return {"final_response": response, "trace": trace, "plan": step_1["description"]}
+
+        if re.search(r"\b(?:ideal|exactly|should i drink|cure|headache|medicine|healthy for me|dehydration|weigh)\b", user_lower):
+            response = "I only track water intake and goals. I can't provide personalized medical or guaranteed hydration advice."
+            trace.append({"step_number": 2, "type": "decision", "description": "Declined a medical or personalized recommendation."})
+            return {"final_response": response, "trace": trace, "plan": step_1["description"]}
 
         if re.search(r"\b(delete|remove|reset|clear|export|reminder|weekly average|monthly|database|history|last week|last month)\b", user_lower):
             response = "I can't perform that action because this coach only supports logging intake and checking today's progress."
@@ -168,9 +193,10 @@ class WaterIntakeAgent:
             return {"final_response": response, "trace": trace, "plan": step_1["description"]}
 
         # Check for goal update intent
-        goal_match = re.search(r"(?:goal|target)\s*(?:is|to|=|set to)?\s*(\d+)\s*(?:ml)?", user_lower)
-        if "goal" in user_lower and goal_match and not ("drank" in user_lower or "logged" in user_lower):
-            target_ml = int(goal_match.group(1))
+        goal_amount, _ = self._parse_amount_ml(user_lower)
+        goal_match = re.search(r"(?:goal|target)\s*(?:is|to|=|set to|of)?", user_lower)
+        if goal_match and goal_amount is not None and not ("drank" in user_lower or "logged" in user_lower):
+            target_ml = goal_amount
             trace.append({
                 "step_number": 2,
                 "type": "tool_call",
@@ -359,17 +385,7 @@ class WaterIntakeAgent:
 
         # Check if Gemini API is configured for full LLM-driven tool calling
         has_timeline = bool(re.search(r"\b(yesterday|ereyesterday|tomorrow|tommorrow|overmorrow|today|last\s+day|day\s+before|day\s+after|next\s+week|next\s+month)\b|\bin\s+\d+\s+(day|days|week|weeks)\b|\b(?:on|for)?\s*\d{4}-\d{2}-\d{2}\b", user_input.lower()))
-        if self.client and self.api_key and not has_timeline:
-            memory_snapshot = copy.deepcopy(self.memory.__dict__)
-            try:
-                result = self._gemini_agent_loop(user_input)
-            except Exception as e:
-                self.memory.__dict__.clear()
-                self.memory.__dict__.update(memory_snapshot)
-                print(f"[Agent Warning] Gemini API execution failed: {e}. Using deterministic plan-act engine.")
-                result = self._rule_based_agent_loop(user_input)
-        else:
-            result = self._rule_based_agent_loop(user_input)
+        result = self._rule_based_agent_loop(user_input)
 
         final_response = result["final_response"]
         trace = result["trace"]
