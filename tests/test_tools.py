@@ -155,6 +155,21 @@ class TestWaterCoachTools:
         assert agent.memory.logs[-1]["date"] == "2026-09-15"
         assert "2026-09-15" in result["response"]
 
+    def test_agent_rejects_ambiguous_and_unsupported_inputs(self):
+        """The agent must not infer container sizes, units, or historical totals."""
+        agent = WaterIntakeAgent()
+        assert "how many ml" in agent.run("I drank a bottle") ["response"].lower()
+        assert "ml or litres" in agent.run("Add 500 oz")["response"].lower()
+        assert "only have today's intake" in agent.run("How much did I drink yesterday?")["response"].lower()
+
+    def test_agent_does_not_log_hypotheticals(self):
+        """Hypothetical questions calculate without changing memory."""
+        agent = WaterIntakeAgent()
+        result = agent.run("If I drink another 500 ml, will I reach my goal?")
+
+        assert agent.memory.today_intake_ml == 0
+        assert "did not log" in result["response"].lower()
+
     def test_multiple_tool_calls_in_agent_loop(self):
         """Verify the agent executes multiple tools (e.g. log_water + get_progress) in a single turn."""
         agent = WaterIntakeAgent()

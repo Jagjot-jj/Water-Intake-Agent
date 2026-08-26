@@ -96,6 +96,31 @@ class WaterIntakeAgent:
         timeline_pattern = r"\b(last|this)\s+(week|month)\b"
         return None, bool(re.search(timeline_pattern, user_lower)), ""
 
+    @staticmethod
+    def _parse_amount_ml(user_lower: str) -> tuple[Optional[int], bool]:
+        """Parse explicit supported volumes; the second value indicates ambiguity."""
+        if re.search(r"\b(bottle|glass|cup|sip|sips)\b", user_lower) and not re.search(r"\d+(?:\.\d+)?\s*(?:ml|milliliters?|l|liters?)\b", user_lower):
+            return None, True
+        unit_pattern = r"(\d+(?:\.\d+)?)\s*(ml|milliliters?|l|liters?)\b"
+        matches = re.findall(unit_pattern, user_lower)
+        if matches:
+            total = 0.0
+            for value, unit in matches:
+                total += float(value) * (1000 if unit.startswith("l") else 1)
+            return round(total), False
+        word_amounts = {
+            "half a litre": 500, "half litre": 500, "one and a half litres": 1500,
+            "one litre": 1000, "a litre": 1000, "two litres": 2000,
+        }
+        for phrase, amount in word_amounts.items():
+            if phrase in user_lower:
+                return amount, False
+        return None, False
+
+    @staticmethod
+    def _is_hypothetical(user_lower: str) -> bool:
+        return bool(re.search(r"\b(if|would|could|suppose|assuming)\b|\bhow much would\b|\bwill i reach\b", user_lower))
+
     def _rule_based_agent_loop(self, user_input: str) -> Dict[str, Any]:
         """Deterministic Plan-Act-Observe-Decide loop for offline testing or fallback."""
         trace: List[Dict[str, Any]] = []
@@ -108,6 +133,39 @@ class WaterIntakeAgent:
             "description": "Analyzed user message to identify hydration intent, quantities, and necessary tool steps."
         }
         trace.append(step_1)
+
+        if re.search(r"\b(delete|remove|reset|clear|export|reminder|weekly average|monthly|database|history|last week|last month)\b", user_lower):
+            response = "I can't perform that action because this coach only supports logging intake and checking today's progress."
+            trace.append({"step_number": 2, "type": "decision", "description": "Declined an unsupported action without changing memory."})
+            return {"final_response": response, "trace": trace, "plan": step_1["description"]}
+
+        if re.search(r"\b(ignore|pretend|assume|fake|invent|say that)\b", user_lower):
+            response = "I can only report values returned by the stored progress state; I won't invent intake or tool results."
+            trace.append({"step_number": 2, "type": "decision", "description": "Rejected an attempt to override grounded tool state."})
+            return {"final_response": response, "trace": trace, "plan": step_1["description"]}
+
+        if re.search(r"\b(yesterday|ereyesterday|last week|last month|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b", user_lower) and re.search(r"\b(how much|what did i drink|intake|consumed)\b", user_lower) and not re.search(r"\b\d", user_lower):
+            response = "I only have today's intake available; I don't have reliable historical totals for that date."
+            trace.append({"step_number": 2, "type": "decision", "description": "Declined to fabricate unavailable historical intake."})
+            return {"final_response": response, "trace": trace, "plan": step_1["description"]}
+
+        if self._is_hypothetical(user_lower):
+            amount, ambiguous = self._parse_amount_ml(user_lower)
+            if ambiguous:
+                response = "Please provide the bottle, glass, or cup capacity in ml; I won't guess it."
+            elif amount is not None:
+                current = self.memory.get_state()
+                projected = current["today_intake_ml"] + amount
+                response = f"Hypothetically, {projected} ml would be {round((projected / current['daily_goal_ml']) * 100, 1)}% of your {current['daily_goal_ml']} ml goal. I did not log it."
+            else:
+                response = "Please provide the amount in ml or litres. I did not log anything."
+            trace.append({"step_number": 2, "type": "decision", "description": "Answered hypothetically without calling log_water."})
+            return {"final_response": response, "trace": trace, "plan": step_1["description"]}
+
+        if re.search(r"\b(?:oz|ounces?|gallons?|grams?)\b", user_lower):
+            response = "I support water amounts in ml or litres only. Please convert the amount before logging it."
+            trace.append({"step_number": 2, "type": "decision", "description": "Rejected an unsupported unit without conversion assumptions."})
+            return {"final_response": response, "trace": trace, "plan": step_1["description"]}
 
         # Check for goal update intent
         goal_match = re.search(r"(?:goal|target)\s*(?:is|to|=|set to)?\s*(\d+)\s*(?:ml)?", user_lower)
@@ -146,14 +204,16 @@ class WaterIntakeAgent:
 
         amount_to_log = None
         if has_log_intent:
-            amounts = re.findall(r"\b(\d+)\s*(?:ml)?\b", user_lower)
-            if amounts:
-                # Pick the most relevant integer (e.g. 500, 300)
-                for a in amounts:
-                    val = int(a)
-                    if 10 <= val <= 5000:
-                        amount_to_log = val
-                        break
+            amount_to_log, ambiguous_amount = self._parse_amount_ml(user_lower)
+            if ambiguous_amount:
+                clarification = "How many ml was the glass, bottle, cup, or sip? I won't assume a container size."
+                trace.append({"step_number": 2, "type": "decision", "description": "Requested an explicit volume for an ambiguous quantity."})
+                return {"final_response": clarification, "trace": trace, "plan": step_1["description"]}
+
+            if amount_to_log is not None and (amount_to_log <= 0 or amount_to_log > 5000):
+                response = "Please provide a positive water amount no greater than 5000 ml per log."
+                trace.append({"step_number": 2, "type": "decision", "description": "Rejected an invalid or excessive amount before tool execution."})
+                return {"final_response": response, "trace": trace, "plan": step_1["description"]}
 
         if amount_to_log is not None:
             intake_date, has_timeline, timeline_label = self._intake_date_from_text(user_lower)
@@ -240,6 +300,12 @@ class WaterIntakeAgent:
             elif is_future:
                 advice = f"Scheduled {amount_to_log} ml for {timeline_label}. Today's total remains {total} ml ({percent}% of your {goal} ml goal)."
             return {"final_response": advice, "trace": trace, "plan": step_1["description"]}
+
+        is_progress_question = bool(re.search(r"\b(how much|what is|what's|how many|progress|remaining|need)\b", user_lower))
+        if has_log_intent and not is_progress_question and re.search(r"\b(?:drank|had|add|log|consumed)\b", user_lower):
+            response = "Please provide a positive amount in ml or litres; I won't guess or log an unspecified amount."
+            trace.append({"step_number": 2, "type": "decision", "description": "Requested an explicit supported quantity."})
+            return {"final_response": response, "trace": trace, "plan": step_1["description"]}
 
         # Check for inquiry / progress check
         # e.g., "How much more do I need?", "How much have I had today?", "What is my progress?"

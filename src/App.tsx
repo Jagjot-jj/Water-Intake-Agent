@@ -75,6 +75,19 @@ function resolveIntakeDate(text: string) {
   return { date: null, hasTimeline: hasUnsupportedTimeline, label: '' };
 }
 
+function parseAmountMl(text: string) {
+  const explicitVolume = /\d+(?:\.\d+)?\s*(?:ml|milliliters?|l|liters?)\b/.test(text);
+  if (/\b(bottle|glass|cup|sip|sips)\b/.test(text) && !explicitVolume) return { amount: null, ambiguous: true };
+  const matches = [...text.matchAll(/(\d+(?:\.\d+)?)\s*(ml|milliliters?|l|liters?)\b/g)];
+  if (matches.length) {
+    const amount = matches.reduce((total, match) => total + Number(match[1]) * (match[2].startsWith('l') ? 1000 : 1), 0);
+    return { amount: Math.round(amount), ambiguous: false };
+  }
+  const wordAmounts: Record<string, number> = { 'half a litre': 500, 'half litre': 500, 'one and a half litres': 1500, 'one litre': 1000, 'a litre': 1000, 'two litres': 2000 };
+  const phrase = Object.keys(wordAmounts).find(key => text.includes(key));
+  return { amount: phrase ? wordAmounts[phrase] : null, ambiguous: false };
+}
+
 export default function App() {
   // Conversation Memory State (Identical to Python ConversationMemory class)
   const [memory, setMemory] = useState<MemoryState>({
@@ -181,6 +194,37 @@ export default function App() {
       });
 
       let finalResponse = '';
+      const unsupportedAction = /\b(delete|remove|reset|clear|export|reminder|weekly average|monthly|database|history|last week|last month)\b/.test(userLower);
+      const promptInjection = /\b(ignore|pretend|assume|fake|invent|say that)\b/.test(userLower);
+      const hypothetical = /\b(if|would|could|suppose|assuming)\b|\bhow much would\b|\bwill i reach\b/.test(userLower);
+      const parsedAmount = parseAmountMl(userLower);
+      if (unsupportedAction) {
+        finalResponse = "I can't perform that action because this coach only supports logging intake and checking today's progress.";
+        trace.push({ step_number: 2, type: 'decision', description: 'Declined an unsupported action without changing memory.' });
+      } else if (promptInjection) {
+        finalResponse = "I can only report values returned by the stored progress state; I won't invent intake or tool results.";
+        trace.push({ step_number: 2, type: 'decision', description: 'Rejected an attempt to override grounded tool state.' });
+      } else if (hypothetical) {
+        if (parsedAmount.ambiguous) {
+          finalResponse = "Please provide the bottle, glass, or cup capacity in ml; I won't guess it.";
+        } else if (parsedAmount.amount !== null) {
+          const projected = memory.today_intake_ml + parsedAmount.amount;
+          finalResponse = `Hypothetically, ${projected} ml would be ${Math.round((projected / memory.daily_goal_ml) * 1000) / 10}% of your ${memory.daily_goal_ml} ml goal. I did not log it.`;
+        } else {
+          finalResponse = 'Please provide the amount in ml or litres. I did not log anything.';
+        }
+        trace.push({ step_number: 2, type: 'decision', description: 'Answered hypothetically without calling log_water.' });
+      } else {
+        const historicalQuestion = /\b(yesterday|ereyesterday|last week|last month|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b/.test(userLower) && /\b(how much|what did i drink|intake|consumed)\b/.test(userLower) && !/\b\d/.test(userLower);
+        const unsupportedUnit = /\b(?:oz|ounces?|gallons?|grams?)\b/.test(userLower);
+        if (historicalQuestion) {
+          finalResponse = "I only have today's intake available; I don't have reliable historical totals for that date.";
+          trace.push({ step_number: 2, type: 'decision', description: 'Declined to fabricate unavailable historical intake.' });
+        } else if (unsupportedUnit) {
+          finalResponse = "I support water amounts in ml or litres only. Please convert the amount before logging it.";
+          trace.push({ step_number: 2, type: 'decision', description: 'Rejected an unsupported unit without conversion assumptions.' });
+        } else {
+        const isProgressQuestion = /\b(how much|what is|what's|how many|progress|remaining|need)\b/.test(userLower);
 
       // Check if user is updating goal
       const goalMatch = userLower.match(/(?:goal|target)\s*(?:is|to|=|set to)?\s*(\d+)\s*(?:ml)?/);
@@ -212,18 +256,16 @@ export default function App() {
         const hasLogIntent = /(?:drank|had|logged|add|plus|another|consumed|drinking|bottle|glass|cup|ml)/.test(userLower) || numbersFound;
         let amountToLog: number | null = null;
 
-        if (hasLogIntent && numbersFound) {
-          for (const n of numbersFound) {
-            const val = parseInt(n, 10);
-            if (val >= 10 && val <= 5000) {
-              amountToLog = val;
-              break;
-            }
-          }
-        }
+        if (hasLogIntent) amountToLog = parsedAmount.amount;
 
         const unsupportedTimeline = hasTimeline && !resolvedDate.date;
-        if (amountToLog !== null && !unsupportedTimeline) {
+        if (parsedAmount.ambiguous) {
+          finalResponse = "How many ml was the glass, bottle, cup, or sip? I won't assume a container size.";
+          trace.push({ step_number: 2, type: 'decision', description: 'Requested an explicit volume for an ambiguous quantity.' });
+        } else if (amountToLog !== null && (amountToLog <= 0 || amountToLog > 5000)) {
+          finalResponse = 'Please provide a positive water amount no greater than 5000 ml per log.';
+          trace.push({ step_number: 2, type: 'decision', description: 'Rejected an invalid or excessive amount before tool execution.' });
+        } else if (amountToLog !== null && !unsupportedTimeline) {
           const timelineLabel = resolvedDate.label;
           const intakeDate = resolvedDate.date || new Date().toISOString().split('T')[0];
           const isHistorical = new Date(`${intakeDate}T00:00:00Z`) < new Date(`${todayIso}T00:00:00Z`);
@@ -307,6 +349,9 @@ export default function App() {
         } else if (unsupportedTimeline) {
           finalResponse = "I can log water for a specific date, but I don't recognize that timeline. Please say today, yesterday, tomorrow, or provide an ISO date like 2026-08-28.";
           trace.push({ step_number: 2, type: 'decision', description: 'Requested clarification because the timeline was not supported.' });
+        } else if (!isProgressQuestion && hasLogIntent && /\b(?:drank|had|add|log|consumed)\b/.test(userLower)) {
+          finalResponse = "Please provide a positive amount in ml or litres; I won't guess or log an unspecified amount.";
+          trace.push({ step_number: 2, type: 'decision', description: 'Requested an explicit supported quantity.' });
         } else {
           // Progress inquiry only
           trace.push({
@@ -340,6 +385,8 @@ export default function App() {
             finalResponse = `You have had ${progressRes.today_intake_ml} ml of water today. Your daily goal is ${progressRes.daily_goal_ml} ml, leaving ${progressRes.remaining_ml} ml remaining (${progressRes.progress_percent}% completed).`;
           }
         }
+        }
+      }
       }
 
       // Ask Gemini to refine the grounded response through the server-side API.
