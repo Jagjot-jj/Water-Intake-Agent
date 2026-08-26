@@ -193,6 +193,15 @@ class TestWaterCoachTools:
         assert agent.memory.daily_goal_ml == 2000
         assert "2000" in result["response"]
 
+    def test_agent_handles_greetings_without_tools(self):
+        """Common formal and informal greetings should not query or mutate hydration state."""
+        agent = WaterIntakeAgent()
+        for greeting in ["hi", "Hello!", "good morning", "Greetings", "hey there"]:
+            result = agent.run(greeting)
+            assert "water intake coach" in result["response"].lower()
+            assert agent.memory.today_intake_ml == 0
+            assert not any(step.get("type") == "tool_call" for step in result["trace"])
+
     def test_multiple_tool_calls_in_agent_loop(self):
         """Verify the agent executes multiple tools (e.g. log_water + get_progress) in a single turn."""
         agent = WaterIntakeAgent()

@@ -200,7 +200,11 @@ export default function App() {
       const contradictoryAmounts = [...userLower.matchAll(/\d+(?:\.\d+)?\s*(?:ml|milliliters?|l|lit(?:er|re)s?)\b/g)].length > 1 && /\b(?:actually|rather|but)\b/.test(userLower);
       const ambiguousTime = /\blast\s+night\b/.test(userLower) && /\b(?:drank|had|add|log|consumed)\b/.test(userLower);
       const medicalQuestion = /\b(?:ideal|exactly|should i drink|cure|headache|medicine|healthy for me|dehydration|weigh)\b/.test(userLower);
-      if (doNotLog) {
+      const greeting = /^(?:hi|hello|hey|hiya|good\s+(?:morning|afternoon|evening)|greetings|howdy|hello\s+there|hi\s+there|hey\s+there)[!. ]*$/.test(userLower);
+      if (greeting) {
+        finalResponse = "Hello! I'm your Water Intake Coach. Tell me how much water you drank, or ask for today's progress.";
+        trace.push({ step_number: 2, type: 'decision', description: 'Recognized a greeting without invoking hydration tools.' });
+      } else if (doNotLog) {
         finalResponse = 'Understood. I did not log anything.';
         trace.push({ step_number: 2, type: 'decision', description: 'Honored the request not to mutate intake state.' });
       } else if (negativeAmount) {

@@ -134,6 +134,11 @@ class WaterIntakeAgent:
         }
         trace.append(step_1)
 
+        if re.fullmatch(r"(?:hi|hello|hey|hiya|good\s+(?:morning|afternoon|evening)|greetings|howdy|hello\s+there|hi\s+there|hey\s+there)[!. ]*", user_lower):
+            response = "Hello! I'm your Water Intake Coach. Tell me how much water you drank, or ask for today's progress."
+            trace.append({"step_number": 2, "type": "decision", "description": "Recognized a greeting without invoking hydration tools."})
+            return {"final_response": response, "trace": trace, "plan": step_1["description"]}
+
         if re.search(r"\blast\s+night\b", user_lower) and re.search(r"\b(?:drank|had|add|log|consumed)\b", user_lower):
             response = "Was that intake today or yesterday? 'Last night' can cross midnight, so I won't guess the date."
             trace.append({"step_number": 2, "type": "decision", "description": "Requested clarification for an ambiguous time."})
